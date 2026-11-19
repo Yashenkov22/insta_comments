@@ -1,0 +1,1386 @@
+import json
+import time
+
+from math import ceil
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+
+from asyncio import sleep
+
+from arq import Retry
+
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, text, func
+
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import contains_eager, joinedload
+
+from config import ADMIN_URL, GENERATE_PHOTO_CAPTION
+from db.base import Account, Attachment, Thread, Message
+from db.queries import (execute_and_catch_db_error, get_N_last_messages, get_account_scenario_data_by_id, get_all_message_count, get_comment_notification_by_id,
+                        get_message_by_id,
+                        get_account_by_id, get_message_slice,
+                        get_messages_only_by_id, get_new_thread_messages,
+                        get_thread_by_id,
+                        get_thread_only_by_id,
+                        get_message_only_by_id, get_threads_by_color)
+
+from utils.base import (try_block_thread,
+                        try_get_profile_port,
+                        try_start_profile,
+                        try_stop_profile,
+                        try_connect_to_main_instagram_page,
+                        utc_timezones)
+from utils.scenarios import do_current_step_coffee_scenario, route_jev_coffee_scenario, coffee_scenario
+from utils.schemas import CoffeeLogStepSchema, CoffeeStateSchema, GeneratedAnswerSchema
+from utils.tasks import (answer_to_comment_under_post_and_to_dm, get_coffee_state, get_raw_messages_log_and_new_last_message_id, need_run_coffee_scenario, parse_comment_notifications_playwright, parse_thread_playwright,
+                         playwright_send_message,
+                         test_playwright,
+                         try_update_thread_memory)
+from utils.ai import ai_translate_message, ai_translate_user_information, generate_caption_to_coffee_scenario_photo, generate_how_are_you_message_to_thread, generate_new_message_to_thread
+from utils.enums import CoffeeStatusEnum, CoffeeStepLogSchema, MessageStatusEnum, MessageTypeEnum
+
+from websocket.redis_listener import publish_event
+
+from .base import (acquire_task_lock,
+                   get_redis_pool,
+                   acquire_lock,
+                   release_lock,
+                   release_task_lock)
+
+
+
+async def start_polling_for_accounts(cxt):
+        print('TASK FROM ARQ ✅')
+        query = (
+              select(Account)\
+              .where(
+                  and_(
+                    Account.folder_id.isnot(None),
+                    Account.profile_id.isnot(None),
+                    Account.is_active == True,
+                  )
+                    )
+                )
+        
+        sessionmaker= cxt['sessionmaker']
+        
+        async with sessionmaker() as _session:
+            _session: AsyncSession
+            result = await execute_and_catch_db_error(_session.execute(query),
+                                                      _session)
+            accounts: list[Account] = result.scalars().all()
+
+        _redis_pool= get_redis_pool()
+
+        for account in accounts:
+            folder_id = account.folder_id
+            profile_id = account.profile_id
+
+            if folder_id and profile_id:
+
+                _key = f'lock:polling_account:{account.id}'
+                task_lock = acquire_task_lock(_key)
+
+                if not task_lock:
+                    continue
+                
+                is_request = False
+
+                job = await _redis_pool.enqueue_job(
+                    'parse_account',
+                    account.id,
+                    folder_id,
+                    profile_id,
+                    task_lock,
+                    is_request,
+                    _job_id=_key,
+                    _queue_name='arq:polling',
+                )
+
+                print('ACCOUNT PARSE JOB RUNNING...', job)
+
+
+async def start_polling_request_messages_for_accounts(cxt):
+        print('TASK FROM REQUEST ARQ ✅')
+        query = (
+              select(Account)\
+              .where(
+                  and_(
+                    Account.folder_id.isnot(None),
+                    Account.profile_id.isnot(None),
+                    Account.is_active == True,
+                  )
+                    )
+                )
+        
+        sessionmaker= cxt['sessionmaker']
+        
+        async with sessionmaker() as _session:
+            _session: AsyncSession
+            result = await execute_and_catch_db_error(_session.execute(query),
+                                                      _session)
+            accounts: list[Account] = result.scalars().all()
+
+        _redis_pool= get_redis_pool()
+
+        for account in accounts:
+            folder_id = account.folder_id
+            profile_id = account.profile_id
+
+            if folder_id and profile_id:
+
+                _key = f'lock:polling_request_account:{account.id}'
+                task_lock = acquire_task_lock(_key)
+
+                if not task_lock:
+                    continue
+                
+                is_request = True
+
+                job = await _redis_pool.enqueue_job(
+                    'parse_account',
+                    account.id,
+                    folder_id,
+                    profile_id,
+                    task_lock,
+                    is_request,
+                    _job_id=_key,
+                    _queue_name='arq:polling',
+                )
+
+                print('ACCOUNT PARSE JOB RUNNING...', job)
+
+
+async def start_task_for_check_unaswer_coffee_threads(cxt):
+    print('TASK FOR CHECK UNASWER COFFEE STATE THREADS FROM ARQ ✅')
+
+    last_message_subquery = (
+        select(
+            Message.thread_id,
+            func.max(Message.id).label("last_message_id")
+        )
+        .where(Message.status == 'approved')
+        .group_by(Message.thread_id)
+        .subquery()
+    )
+
+    query = (
+        select(Thread, Message)
+        .join(Thread.account)  # INNER JOIN: треды без аккаунта отсекутся
+        .where(
+            Thread.coffee_state.is_not(None),
+            Thread.coffee_state != text("'null'::jsonb"),
+            Account.is_active.is_(True),
+        )
+        .outerjoin(
+            last_message_subquery,
+            last_message_subquery.c.thread_id == Thread.id
+        )
+        .outerjoin(
+            Message,
+            Message.id == last_message_subquery.c.last_message_id
+        )
+        .options(contains_eager(Thread.account))
+    )
+
+    sessionmaker= cxt['sessionmaker']
+    _redis_pool = get_redis_pool()
+        
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        result = await execute_and_catch_db_error(_session.execute(query),
+                                                    _session)
+        threads: list[Thread] = result.all()
+
+
+    for thread, last_message in threads:
+        thread: Thread
+        last_message: Message
+
+        coffee_state = get_coffee_state(thread)
+
+        if coffee_state.status == CoffeeStatusEnum.ACTIVE:
+            threshold = datetime.now(timezone.utc) - timedelta(minutes=10)
+            if last_message.sender == 'user' and last_message.created_at < threshold:
+                job = await _redis_pool.enqueue_job(
+                    'background_how_are_you_generation',
+                    thread.id,
+                    _queue_name='arq:ai',
+                )
+                print(f'THREAD JOB FOR CHECK UNANSWER  FOR THREAD {thread.id} RUNNING...',)
+            else:
+                print(f' -> последнее сообщение не от юзера или новее {last_message.created_at}  {last_message.id}!')
+        else:
+            print(f' -> сценарий не активен в чате {thread.id} - status {coffee_state.status} !')
+
+
+async def parse_account(cxt,
+                        account_id: int,
+                        folder_id: str,
+                        profile_id: str,
+                        task_lock: str,
+                        is_request: bool = False):
+    try:
+        print(f'TASK PARSE ACCOUNT WITH ID {account_id} ✅')
+        
+        sessionmaker = cxt["sessionmaker"]
+        redis_pool = cxt['redis_pool']
+        
+        actived_profile = await try_start_profile(folder_id,
+                                                  profile_id)
+        
+        async with sessionmaker() as _session:
+            account = await get_account_by_id(account_id,
+                                              _session)
+        
+        if not account:
+            print(f'not account with {account_id}')
+            return
+        
+        print(actived_profile)
+        
+        profile_port = actived_profile.get('port')
+
+        print('PORT', profile_port)
+
+        if not profile_port:
+            profile_port = await try_get_profile_port(folder_id,
+                                                      profile_id)
+
+        await sleep(3)
+        
+        async with sessionmaker() as _session:
+            await test_playwright(account,
+                                profile_port,
+                                folder_id,
+                                profile_id,
+                                redis_pool,
+                                _session,
+                                is_request)
+    except Exception as ex:
+        print(ex)
+    finally:
+        _key = f'lock:polling_account:{account_id}' if not is_request\
+         else f'lock:polling_request_account:{account.id}'
+        release_task_lock(_key,
+                          task_lock)
+
+
+async def parse_thread(cxt,
+                       account_id: int,
+                       thread_id: int):
+    print(f'TASK PARSE THREAD WITH ID {thread_id} ✅')
+
+    sessionmaker = cxt["sessionmaker"]
+    redis = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        account = await get_account_by_id(account_id,
+                                          _session)
+        thread = await get_thread_by_id(thread_id,
+                                       _session)
+    
+    if not account or not thread:
+        print('stop here 1')
+        return
+    
+    available_lock = acquire_lock(account.id,
+                                  thread_id)
+
+    if not available_lock:
+        print('stop here 2')
+        raise Retry(defer=15)
+
+    actived_profile = await try_start_profile(account.folder_id,
+                                              account.profile_id)
+
+    print(actived_profile)
+    
+    profile_port = actived_profile.get('port')
+
+    print('PORT', profile_port)
+
+    try:
+        if profile_port:
+
+            await sleep(3)
+            
+            async with sessionmaker() as _session:
+                _session: AsyncSession
+                thread = await _session.merge(thread)
+                await parse_thread_playwright(account,
+                                              thread,
+                                              profile_port,
+                                              _session,
+                                              redis)
+    finally:
+        release_lock(account_id, thread_id, available_lock)
+
+
+
+async def send_message_to_thread(cxt,
+                                 account_id: int,
+                                 message_id: int):
+    print('TASK TRY SEND MESSAGE ✅')
+    query = (
+        select(Account)\
+        .where(
+            and_(
+                Account.folder_id.isnot(None),
+                Account.profile_id.isnot(None),
+                Account.is_active == True,
+                Account.id == account_id,
+            )
+        )
+    )
+
+    sessionmaker= cxt['sessionmaker']
+    redis = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        res = await execute_and_catch_db_error(_session.execute(query),
+                                            _session)
+
+        account = res.scalar_one_or_none()
+        message = await get_message_by_id(message_id,
+                                          _session)
+
+    if not account or not message:
+        print('Account or Message Not found')
+        print(' ### account', account_id, account)
+        print(' ### message', message_id, message)
+        return
+    
+    # available_lock = acquire_lock(account.id,
+    #                               message.thread_id)
+
+    # if not available_lock:
+    #     print('error 2')
+    #     async with sessionmaker() as _session:
+    #         _session: AsyncSession
+    #         _message = await _session.merge(message)
+    #         _message.retry_send_count += 1
+    #         await execute_and_catch_db_error(_session.commit(),
+    #                                          _session,
+    #                                          with_rollback=True)
+        
+    #     # ws событие об изменении message
+    #     payload = {
+    #         'thread_id': message.thread_id,
+    #     }
+    #     msg_payload = {
+    #         'id': str(message.id),
+    #         "retry_send_count": _message.retry_send_count,
+    #     }
+
+    #     payload['message'] = msg_payload
+
+    #     await publish_event(redis,
+    #                         type='Message send count updated',
+    #                         payload=payload)
+
+    #     raise Retry(defer=15)
+    
+    try:
+        _key = f'lock:send_message:acc:{account.id}:msg:{message_id}'
+        task_lock = acquire_task_lock(_key)
+
+        if not task_lock:
+            raise Retry(defer=15)
+
+        if message:
+            media_type = None
+            folder_id = account.folder_id
+            profile_id = account.profile_id
+
+            if folder_id and profile_id:
+                #try start profile
+                actived_profile = await try_start_profile(folder_id,
+                                                          profile_id)
+                
+                print(actived_profile)
+                
+                profile_port = actived_profile.get('port')
+
+                print('PORT', profile_port)
+
+                if profile_port:
+
+                    # update message status
+                    async with sessionmaker() as _session:
+                        _session: AsyncSession
+                        message.status = MessageStatusEnum.MODERATED
+                        await _session.merge(message)
+                        await execute_and_catch_db_error(_session.commit(),
+                                                        _session,
+                                                        with_rollback=True)
+                    payload = {
+                        'thread_id': message.thread_id,
+                    }
+                    message_payload = {
+                        'id': str(message.id),
+                        "modStatus": message.status,
+                    }
+                    payload['message'] = message_payload
+ 
+                    await publish_event(redis,
+                                        type='Message updated',
+                                        payload=payload,
+                                        account_id=account.id)
+                    
+                    await sleep(2)
+
+                    attachments = message.attachments
+
+                    if attachments:
+                        _attachment = attachments[0]
+
+                        media_type = _attachment.media_type
+                    
+                    async with sessionmaker() as _session:
+                        _session: AsyncSession
+                        await _session.merge(message)
+                        await playwright_send_message(message,
+                                                    profile_port,
+                                                    folder_id,
+                                                    profile_id,
+                                                    _session,
+                                                    redis,
+                                                    media_type)  
+        else:
+            print('error 3')
+
+    except Retry as ex:
+        print(f'CATCH RETRY FOR ACC_ID {account_id} MSG_ID {message_id}')
+
+        async with sessionmaker() as _session:
+            _session: AsyncSession
+            _message = await _session.merge(message)
+            _message.retry_send_count += 1
+            await execute_and_catch_db_error(_session.commit(),
+                                             _session,
+                                             with_rollback=True)
+        
+        # ws событие об изменении message
+        payload = {
+            'thread_id': message.thread_id,
+        }
+        msg_payload = {
+            'id': str(message.id),
+            "retry_send_count": _message.retry_send_count,
+        }
+
+        payload['message'] = msg_payload
+
+        await publish_event(redis,
+                            type='Message send count updated',
+                            payload=payload,
+                            account_id=account.id)
+        raise
+
+    except Exception as ex:
+        print('ERROR WITH TRY SEND MESSAGE', ex)
+    finally:
+        try:
+            # release_lock(account_id, message.thread_id, available_lock)
+            release_task_lock(_key, task_lock)
+        except Exception:
+            pass
+
+
+async def try_start_stop_vision_profile_by_account_id(cxt,
+                                                      account_id: int,
+                                                      marker: Literal['start', 'stop']):
+    sessionmaker= cxt['sessionmaker']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        account = await get_account_by_id(account_id,
+                                        _session)
+    
+    is_success = None
+    
+    if not account or\
+          not (account.folder_id and account.profile_id):
+        raise
+
+    match marker:
+        case 'start':
+            actived_profile = await try_start_profile(account.folder_id,
+                                                    account.profile_id)
+
+            profile_port = actived_profile.get('port')
+
+            warning_message = actived_profile.get('message')
+
+            print('PORT', profile_port)
+
+            if profile_port:
+                is_success = await try_connect_to_main_instagram_page(profile_port)
+
+            return is_success
+        case 'stop':
+            await try_stop_profile(account.folder_id,
+                                   account.profile_id)
+
+
+async def try_block_thread_by_account_id(cxt,
+                                        account_id: int,
+                                        thread_id: int):
+    sessionmaker= cxt['sessionmaker']
+    redis_pool = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        account = await get_account_by_id(account_id,
+                                        _session)
+        thread = await get_thread_only_by_id(thread_id,
+                                             _session)
+        
+        if not account or\
+            not (account.folder_id and account.profile_id):
+            raise
+
+        if not thread:
+            raise
+
+        thread.proccess_block = True
+
+        await execute_and_catch_db_error(_session.commit(),
+                                         _session,
+                                         with_rollback=True)
+        
+
+    payload = {
+        'account_id': thread.account_id,
+    }
+
+    thread_payload = {
+        'id': thread.id,
+        'context': thread.context,
+        'has_unread': thread.is_unread,
+        "last_activity": thread.timestamp_last_seen_message.strftime("%Y-%d-%m %H:%M")\
+                        if thread.timestamp_last_seen_message else "",
+        'is_approved': thread.is_approved,
+        'is_pinned': thread.is_pinned,
+        'is_blocked': thread.is_blocked,
+        'proccess_block': thread.proccess_block}
+
+    payload['thread'] = thread_payload
+    
+    await publish_event(redis_pool,
+            type='Thread process block',
+            payload=payload,
+            account_id=thread.account_id)
+        
+
+    actived_profile = await try_start_profile(account.folder_id,
+                                            account.profile_id)
+    print(actived_profile)
+
+    profile_port = actived_profile.get('port')
+
+    warning_message = actived_profile.get('message')
+
+    print('PORT', profile_port)
+
+    thread_url = f'https://www.instagram.com/direct/t/{thread.thread_id}/'
+
+    if profile_port:
+        await sleep(1)
+        res = await try_block_thread(profile_port,
+                               thread_url)
+
+        if res:
+            async with sessionmaker() as _session:
+                _session: AsyncSession
+                thread = await _session.merge(thread)
+                thread.is_blocked = True
+                thread.proccess_block = False
+                
+                await execute_and_catch_db_error(_session.commit(),
+                                                _session,
+                                                with_rollback=True)
+                
+                print(' + Thread has blocked!!!')
+                
+                payload = {
+                    'account_id': thread.account_id,
+                }
+
+                thread_payload = {
+                    'id': thread.id,
+                    'context': thread.context,
+                    'has_unread': thread.is_unread,
+                    "last_activity": thread.timestamp_last_seen_message.strftime("%Y-%d-%m %H:%M")\
+                                    if thread.timestamp_last_seen_message else "",
+                    'is_approved': thread.is_approved,
+                    'is_pinned': thread.is_pinned,
+                    'is_blocked': thread.is_blocked,
+                    'proccess_block': thread.proccess_block}
+
+                payload['thread'] = thread_payload
+                
+                await publish_event(redis_pool,
+                        type='Thread has blocked',
+                        payload=payload,
+                        account_id=thread.account_id)
+        else:
+            print('not change')
+
+
+async def try_translate_message_text(cxt,
+                                     message_ids: list[int]):
+    print(f' -> running translate task for {message_ids} msgs...')
+    
+    sessionmaker= cxt['sessionmaker']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        messages = await get_messages_only_by_id(message_ids,
+                                                 _session)
+        
+        if not messages:
+            return
+        
+        for message in messages:
+            if message.text and not message.translated_text:
+                _text = await ai_translate_message(message.text)
+
+                if _text:
+                    message.translated_text = _text
+
+                await sleep(1)
+
+        await execute_and_catch_db_error(_session.commit(),
+                                        _session,
+                                        with_rollback=True)
+
+
+
+async def generate_thread_memory(cxt,
+                                 thread_id: int):
+    print('start...')
+    sessionmaker= cxt['sessionmaker']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+
+        thread = await get_thread_only_by_id(thread_id,
+                                            _session)
+
+        if not thread:
+            print('error 1')
+            return
+
+        await try_update_thread_memory(thread,
+                                       _session)
+
+        await execute_and_catch_db_error(_session.commit(),
+                                        _session,
+                                        with_rollback=True)
+
+
+
+async def generate_translated_user_information(cxt):
+    print('start...')
+    sessionmaker= cxt['sessionmaker']
+
+    query = (
+        select(Thread)
+        .where(
+            Thread.user_information.is_not(None),
+            Thread.user_information != text("'null'::jsonb"),
+            Thread.user_information != text("'{}'::jsonb"),
+        )
+    )
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+
+        res = await execute_and_catch_db_error(_session.execute(query),
+                                               _session)
+
+        threads = res.scalars().all()
+
+        if not threads:
+            return
+        
+        print(' -> LEN THREADS',len(threads))
+
+        for thread in threads:
+            thread: Thread
+            _info = thread.user_information
+
+            try:
+                _info = json.dumps(_info)
+            except Exception:
+                continue
+
+            translated_info = await ai_translate_user_information(_info)
+            time.sleep(5)
+
+            thread.original_user_information = thread.user_information
+
+            # if isinstance(translated_info, dict):
+            try:
+                thread.user_information = json.loads(translated_info)
+            except Exception:
+                continue
+            print(f'1. {thread.original_user_information}\n2. {thread.user_information}')
+
+        await execute_and_catch_db_error(_session.commit(),
+                                         _session,
+                                         with_rollback=True)
+
+
+
+async def translate_user_information_by_thread_id(cxt,
+                                                  thread_id: int):
+    print(f'start translate task for {thread_id}')
+    sessionmaker= cxt['sessionmaker']
+
+    query = (
+        select(Thread)
+        .where(
+            Thread.id == thread_id,
+        )
+    )
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+
+        res = await execute_and_catch_db_error(_session.execute(query),
+                                               _session)
+
+        thread = res.scalar_one_or_none()
+
+        if not thread:
+            return
+        
+        thread: Thread
+
+        try:
+            _info = json.dumps(thread.original_user_information)
+        except Exception:
+            return
+
+        translated_info = await ai_translate_user_information(_info)
+
+        try:
+            json.loads(translated_info)
+        except Exception as ex:
+            print(ex)
+            return
+
+        thread.user_information = translated_info
+
+        await execute_and_catch_db_error(_session.commit(),
+                                            _session,
+                                            with_rollback=True)
+
+
+async def generate_thread_momory_by_id(cxt,
+                                       thread_id: int):
+    sessionmaker= cxt['sessionmaker']
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+
+        thread = await get_thread_only_by_id(thread_id,
+                                            _session)
+        if not thread:
+            return
+
+        # thread_len = len(threads)
+        try:
+            # for idx, thread in enumerate(threads):
+                # print(f'{idx+1} iteration from {thread_len}...')
+            memory_updated = await try_update_thread_memory(thread,
+                                                            _session)
+                # await sleep(2)
+        except Exception as ex:
+            print(' -> ERROR, NO SAVED',ex)
+            pass
+        else:
+            await execute_and_catch_db_error(_session.commit(),
+                                            _session,
+                                            with_rollback=True)
+            print(f' -> thread {thread_id} has been updated!')
+
+
+def get_message_type(message: Message):
+    attachments = message.attachments
+
+    if attachments:
+        if len(attachments) == 1:
+            attachment = attachments[0]
+            type = attachment.media_type
+        elif len(attachments) == 2:
+            media_urls = [att.media_url for att in attachments]
+
+            if any(media_url for media_url in media_urls if media_url.find('video_preview_') != -1):
+                type = MessageTypeEnum.VIDEO
+            else:
+                type = MessageTypeEnum.MUTLI_MEDIA
+        else:
+            type = MessageTypeEnum.MUTLI_MEDIA
+            
+    else:
+        try:
+            message_text: str = message.text
+
+            if message_text.find('missed an audio call') != -1:
+                type = MessageTypeEnum.SYSTEM
+            elif message_text.find('a video chat') != -1:
+                type = MessageTypeEnum.SYSTEM
+            elif message_text == '* реакция на сообщение в чате':
+                type = MessageTypeEnum.REACTION
+            else:
+                type = MessageTypeEnum.TEXT
+        except Exception as ex:
+            print('ERROR WITH UNDEFINED TYPE', ex)
+            type = MessageTypeEnum.UNDEFINED
+
+    return type
+
+
+async def organize_new_message_types(cxt):
+    print('start organize message types...')
+    sessionmaker= cxt['sessionmaker']
+
+    limit_for_iteration = 1000
+
+    offset = 0
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        message_count = await get_all_message_count(_session)
+
+        iter_count = ceil(message_count / limit_for_iteration)
+
+        for _ in range(iter_count):
+            message_slice = await get_message_slice(offset=offset,
+                                                    limit=limit_for_iteration,
+                                                    session=_session)
+            offset += limit_for_iteration
+
+            for message in message_slice:
+                message: Message
+                message_type = get_message_type(message)
+                message.type = message_type
+        
+        await execute_and_catch_db_error(_session.commit(),
+                                         _session,
+                                         with_rollback=True)
+
+
+async def background_ai_generation(cxt,
+                                   thread_id: int,
+                                   switch_to_scenario_step: bool = False):
+    print(' -> running basic bg ai background...')
+    sessionmaker= cxt['sessionmaker']
+    redis_pool = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        thread = await get_thread_by_id(thread_id,
+                                        _session)
+
+        # memory_updated = await try_update_thread_memory(thread,
+        #                                                 _session,
+        #                                                 redis_pool)
+        # print(f'is memory updated - {memory_updated}')
+        print('basic behaivor...')
+
+        account_timezone = utc_timezones.get(thread.account.utc, None)
+
+        messages_for_raw_log = await get_N_last_messages(message_count=50,
+                                                        thread_id=thread.id,
+                                                        session=_session)
+        raw_messages_log, _, _ = await get_raw_messages_log_and_new_last_message_id(messages_for_raw_log)
+
+        generated_text = await generate_new_message_to_thread(account_info=thread.account.information,
+                                                            thread=thread,
+                                                            thread_context=thread.context,
+                                                            new_messages=raw_messages_log,
+                                                            account_utc=account_timezone)
+
+        message_type = MessageTypeEnum.TEXT
+        
+        insert_data = {
+            'sender': 'assistant',
+            'created_at': datetime.now(tz=timezone.utc),
+            'updated_at': datetime.now(tz=timezone.utc),
+            'thread_id': thread.id,
+            'text': generated_text,
+            'type': message_type,
+            'status': MessageStatusEnum.PENDING,
+        }
+
+        new_generated_message = Message(**insert_data)
+
+        _session.add(new_generated_message)
+
+        await execute_and_catch_db_error(_session.flush(),
+                                         _session)
+
+        if switch_to_scenario_step:
+            coffee_state = get_coffee_state(thread)            
+            coffee_state.is_scenario_step = True
+            thread.coffee_state = coffee_state.model_dump(mode="json")
+
+            payload = {
+                'thread_id': thread_id,
+            }
+            payload['coffee_state'] = thread.coffee_state
+
+            await publish_event(redis_pool,
+                    type='thread coffee state changed',
+                    payload=payload,
+                    account_id=thread.account_id)
+
+        await execute_and_catch_db_error(_session.commit(),
+                                        _session,
+                                        with_rollback=True)
+        
+    if new_generated_message:
+        payload = {
+            'thread_id': new_generated_message.thread_id,
+        }
+        message_payload = {
+            'id': str(new_generated_message.id),
+            'role': new_generated_message.sender,
+            'content': new_generated_message.text,
+            'translated_content': new_generated_message.translated_text or '',
+            'ts': new_generated_message.created_at.strftime("%Y-%d-%m %H:%M") if new_generated_message.created_at else "",
+            "modStatus": new_generated_message.status,
+            'attachment': None,
+
+        }
+        payload['message'] = message_payload
+
+        await publish_event(redis_pool,
+                type='message created',
+                payload=payload,
+                account_id=thread.account_id)
+
+    if switch_to_scenario_step and new_generated_message:
+        job = await redis_pool.enqueue_job(
+            'send_message_to_thread',
+            thread.account_id,
+            new_generated_message.id,
+            _queue_name='arq:messages',
+        )
+
+    # if memory_updated:
+    #     job = await redis_pool.enqueue_job(
+    #         'translate_user_information_by_thread_id',
+    #         thread.id,
+    #         _queue_name='arq:utils',
+    #     )
+
+
+async def background_how_are_you_generation(cxt,
+                                            thread_id: int):
+    print(' -> running HOW ARE YOU ai background...')
+    sessionmaker= cxt['sessionmaker']
+    redis_pool = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        thread = await get_thread_by_id(thread_id,
+                                        _session)
+
+        print('how are you behaivor ...')
+
+        account_timezone = utc_timezones.get(thread.account.utc, None)
+
+        messages_for_raw_log = await get_N_last_messages(message_count=50,
+                                                        thread_id=thread.id,
+                                                        session=_session)
+        raw_messages_log, _, _ = await get_raw_messages_log_and_new_last_message_id(messages_for_raw_log)
+
+        # print(raw_messages_log)
+
+        generated_text = await generate_how_are_you_message_to_thread(account_info=thread.account.information,
+                                                                      thread=thread,
+                                                                      thread_context=thread.context,
+                                                                      new_messages=raw_messages_log)
+
+        message_type = MessageTypeEnum.TEXT
+        
+        insert_data = {
+            'sender': 'assistant',
+            'created_at': datetime.now(tz=timezone.utc),
+            'updated_at': datetime.now(tz=timezone.utc),
+            'thread_id': thread.id,
+            'text': generated_text,
+            'type': message_type,
+            'status': MessageStatusEnum.PENDING,
+        }
+
+        new_generated_message = Message(**insert_data)
+
+        _session.add(new_generated_message)
+
+        await execute_and_catch_db_error(_session.flush(),
+                                        _session)
+
+        await execute_and_catch_db_error(_session.commit(),
+                                        _session,
+                                        with_rollback=True)
+        
+    if new_generated_message:
+        payload = {
+            'thread_id': new_generated_message.thread_id,
+        }
+        message_payload = {
+            'id': str(new_generated_message.id),
+            'role': new_generated_message.sender,
+            'content': new_generated_message.text,
+            'translated_content': new_generated_message.translated_text or '',
+            'ts': new_generated_message.created_at.strftime("%Y-%d-%m %H:%M") if new_generated_message.created_at else "",
+            "modStatus": new_generated_message.status,
+            'attachment': None,
+
+        }
+        payload['message'] = message_payload
+
+        await publish_event(redis_pool,
+                type='message created',
+                payload=payload,
+                account_id=thread.account_id)
+
+    if new_generated_message:
+        job = await redis_pool.enqueue_job(
+            'send_message_to_thread',
+            thread.account_id,
+            new_generated_message.id,
+            _queue_name='arq:messages',
+        )
+
+
+
+async def background_coffee_scenario(cxt,
+                                     thread_id: int):
+    print(' -> running coffee bg ai background...')
+    sessionmaker= cxt['sessionmaker']
+    redis_pool = cxt['redis_pool']
+
+    async with sessionmaker() as _session:
+        _session: AsyncSession
+        thread = await get_thread_by_id(thread_id,
+                                        _session)
+
+        # memory_updated = await try_update_thread_memory(thread,
+        #                                                 _session,
+        #                                                 redis_pool)
+        # print(f'is memory updated - {memory_updated}')
+
+        coffee_state = get_coffee_state(thread)
+
+        account_timezone = utc_timezones.get(thread.account.utc, None)
+
+        if not coffee_state:
+            print(' -> NOT COFFEE STATE!!!')
+            return
+
+        if coffee_state.current_step == 5:
+            if coffee_state.status != CoffeeStatusEnum.MODERATING:
+                coffee_state.status = CoffeeStatusEnum.MODERATING
+                thread.coffee_state = coffee_state.model_dump(mode="json")
+
+                # ws event for coffee_state
+                payload = {
+                    'thread_id': thread_id,
+                }
+                payload['coffee_state'] = thread.coffee_state
+
+                await publish_event(redis_pool,
+                        type='thread coffee state changed',
+                        payload=payload,
+                        account_id=thread.account_id)
+
+                await execute_and_catch_db_error(_session.commit(),
+                                                _session,
+                                                with_rollback=True)
+            else:
+                print(' -> thread waiting moderating...')
+            return
+
+        last_messages = await get_N_last_messages(message_count=100,
+                                                  thread_id=thread.id,
+                                                  session=_session)
+
+        jev_step_action_data = await route_jev_coffee_scenario(thread,
+                                                               coffee_state,
+                                                               last_messages,
+                                                               _session)
+        action_marker = jev_step_action_data.get('action')
+        raw_messages_log = jev_step_action_data.get('last_messages')
+        switch_step = jev_step_action_data.get('switch_step')
+        switch_to_basic_behaivor = jev_step_action_data.get('switch_to_basic_behaivor')
+
+        if action_marker:
+            print('inside action...')
+            coffee_photos = await get_account_scenario_data_by_id(thread.account_id,
+                                                                  _session)
+            generated_message_data: GeneratedAnswerSchema = await do_current_step_coffee_scenario(jev_step_action_data,
+                                                                                                  thread,
+                                                                                                  thread.account,
+                                                                                                  coffee_state,
+                                                                                                  coffee_photos,
+                                                                                                  account_utc=account_timezone)
+            # generated_text, attachment = generated_message_data
+            # generated_text = generated_message_data.text
+            # attachment = generated_message_data.attachment
+
+            # current_step = coffee_state.current_step
+
+            # if current_step == 1:
+            #     print('last basic behaivor before scenario step_2...')
+
+            #     raw_messages_log, _, _ = await get_raw_messages_log_and_new_last_message_id(last_messages)
+
+            #     generated_text = await generate_new_message_to_thread(account_info=thread.account.information,
+            #                                                         thread=thread,
+            #                                                         thread_context=thread.context,
+            #                                                         new_messages=raw_messages_log)
+            # elif current_step == 3:
+            #     print(' -> inside current_step 3...')
+            #     purpose = attachment.pop('purpose')
+            #     generated_text = await generate_caption_to_coffee_scenario_photo(account_info=thread.account.information,
+            #                                                                     thread=thread,
+            #                                                                     new_messages=last_messages,
+            #                                                                     purpose=purpose)
+
+        else:
+            print('basic behaivor...')
+
+            generated_text = await generate_new_message_to_thread(account_info=thread.account.information,
+                                                                  thread=thread,
+                                                                  thread_context=thread.context,
+                                                                  new_messages=raw_messages_log)
+            generated_message_data = GeneratedAnswerSchema(text=generated_text)
+
+        message_type = MessageTypeEnum.TEXT
+
+        generated_text = generated_message_data.text
+        attachment = generated_message_data.attachment
+        
+        if attachment:
+            message_type = attachment.get('media_type')
+        
+        insert_data = {
+            'sender': 'assistant',
+            'created_at': datetime.now(tz=timezone.utc),
+            'updated_at': datetime.now(tz=timezone.utc),
+            'thread_id': thread.id,
+            'text': generated_text,
+            'type': message_type,
+            'status': MessageStatusEnum.PENDING,
+        }
+
+        new_generated_message = Message(**insert_data)
+
+        _session.add(new_generated_message)
+
+        await execute_and_catch_db_error(_session.flush(),
+                                        _session)
+
+        if attachment:
+            message_id = new_generated_message.id
+
+            attachment.pop('purpose', None)
+
+            attachment.update({'message_id': message_id})
+
+            new_attachment = Attachment(**attachment)
+            _session.add(new_attachment)
+
+        await execute_and_catch_db_error(_session.commit(),
+                                        _session,
+                                        with_rollback=True)
+        
+    if new_generated_message:
+        payload = {
+            'thread_id': new_generated_message.thread_id,
+        }
+        message_payload = {
+            'id': str(new_generated_message.id),
+            'role': new_generated_message.sender,
+            'content': new_generated_message.text,
+            'translated_content': new_generated_message.translated_text or '',
+            'ts': new_generated_message.created_at.strftime("%Y-%d-%m %H:%M") if new_generated_message.created_at else "",
+            "modStatus": new_generated_message.status,
+            'attachment': attachment,
+
+        }
+        payload['message'] = message_payload
+
+        await publish_event(redis_pool,
+                type='message created',
+                payload=payload,
+                account_id=thread.account_id)
+
+    # if memory_updated:
+    #     job = await redis_pool.enqueue_job(
+    #         'translate_user_information_by_thread_id',
+    #         thread.id,
+    #         _queue_name='arq:utils',
+    #     )
+
+    if action_marker:
+        current_step = coffee_state.current_step
+        is_scenario_step = coffee_state.is_scenario_step
+        print(f' -> тип шага - {is_scenario_step}')
+
+        home_photo_id = generated_message_data.home_photo_id
+
+        if current_step == 1:
+            if home_photo_id:
+                preparing_data = coffee_state.preparing_data
+                preparing_data.photo_list.append(home_photo_id)
+                preparing_data.last_send_time = datetime.now(tz=timezone.utc)
+                # preparing_data = coffee_state.logs.setdefault('preparing_data', {})
+                # preparing_data.setdefault('photo_list', []).append(home_photo_id)
+                # preparing_data['last_send_time'] = datetime.now(tz=timezone.utc)
+            if switch_step:
+                try:
+                    step_instruction = coffee_scenario.get(f'step_{current_step}').get('instruction')
+                    result_log = f'''Инструкция шага: {step_instruction}\n
+                                    Отправленное сообщение - {ADMIN_URL}/messages/message_{new_generated_message.id}'''
+                    # можно формировать CoffeeLogStepSchema раньше и передавать сюда уже готовый объект ?
+                    coffee_state.logs[f'step_{current_step}'] = CoffeeLogStepSchema(status=CoffeeStepLogSchema.COMPLETED,
+                                                                                    result=result_log)
+                except Exception as ex:
+                    print(ex)
+        else:
+            try:
+                step_instruction = coffee_scenario.get(f'step_{current_step}').get('instruction')
+                result_log = f'''Инструкция шага: {step_instruction}\n
+                                Отправленное сообщение - {ADMIN_URL}/messages/message_{new_generated_message.id}'''
+                # можно формировать CoffeeLogStepSchema раньше и передавать сюда уже готовый объект ?
+                coffee_state.logs[f'step_{current_step}'] = CoffeeLogStepSchema(status=CoffeeStepLogSchema.COMPLETED,
+                                                                                result=result_log)
+            except Exception as ex:
+                print(ex)
+
+        if switch_to_basic_behaivor:
+            coffee_state.is_scenario_step = not is_scenario_step
+        
+        if switch_step:
+            coffee_state.current_step += 1
+
+        async with sessionmaker() as _session:
+            _session: AsyncSession
+            thread: Thread = await _session.merge(thread)
+            thread.coffee_state = coffee_state.model_dump(mode="json")
+
+            await execute_and_catch_db_error(_session.commit(),
+                                            _session,
+                                            with_rollback=True)
+
+        payload = {
+            'thread_id': thread_id,
+        }
+        payload['coffee_state'] = thread.coffee_state
+
+        await publish_event(redis_pool,
+                type='thread coffee state changed',
+                payload=payload,
+                account_id=thread.account_id)
+
+    job = await redis_pool.enqueue_job(
+        'send_message_to_thread',
+        thread.account_id,
+        new_generated_message.id,
+        _queue_name='arq:messages',
+    )
+
+    print(' -> auto send task running...')
+
+
+
+async def try_check_comments(cxt,
+                             account_id: int):
+    try:
+        print(f'TASK PARSE COMMENTS FOR ACCOUNT WITH ID {account_id} ✅')
+        
+        sessionmaker = cxt["sessionmaker"]
+        redis_pool = cxt['redis_pool']
+        
+        async with sessionmaker() as _session:
+            account = await get_account_by_id(account_id,
+                                              _session)
+        
+        if not account:
+            print(f'not account with {account_id}')
+            return
+        
+        actived_profile = await try_start_profile(account.folder_id,
+                                                  account.profile_id)
+        
+        # print(actived_profile)
+        
+        profile_port = actived_profile.get('port')
+
+        print('PORT', profile_port)
+
+        if not profile_port:
+            profile_port = await try_get_profile_port(account.folder_id,
+                                                      account.profile_id)
+
+        await sleep(3)
+        
+        async with sessionmaker() as _session:
+            await parse_comment_notifications_playwright(account=account,
+                                                         profile_port=profile_port,
+                                                         _session=_session,
+                                                         redis=redis_pool,
+                                                         use_comments_filter=True)
+    except Exception as ex:
+        print(ex)
+
+
+async def try_answer_by_comment(cxt,
+                                comment_id: int):
+    try:
+        print(f'TASK ANSWER BY COMMENT WITH ID {comment_id} ✅')
+        
+        sessionmaker = cxt["sessionmaker"]
+        redis_pool = cxt['redis_pool']
+        
+        async with sessionmaker() as _session:
+            comment = await get_comment_notification_by_id(comment_id,
+                                                           _session)
+        
+        if not comment:
+            print(f'not comment with {comment_id}')
+            return
+
+        account = comment.account
+
+        actived_profile = await try_start_profile(account.folder_id,
+                                                  account.profile_id)
+                
+        profile_port = actived_profile.get('port')
+
+        print('PORT', profile_port)
+
+        if not profile_port:
+            profile_port = await try_get_profile_port(account.folder_id,
+                                                      account.profile_id)
+
+        await sleep(3)
+        
+        async with sessionmaker() as _session:
+            comment = await _session.merge(comment)
+            await answer_to_comment_under_post_and_to_dm(comment=comment,
+                                                         profile_port=profile_port,
+                                                         _session=_session)
+    except Exception as ex:
+        print(ex)

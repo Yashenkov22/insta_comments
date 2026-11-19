@@ -1,0 +1,155 @@
+from enum import Enum
+
+
+# class MessageTypeEnum(str, Enum):
+#     TEXT = "text"
+#     VIDEO = "video"
+#     PHOTO = "photo"
+#     AUDIO = "audio"
+#     AUDIOMESSAGE = "audiomessage"
+#     VIDEOMESSAGE = "videomessage"
+
+
+class MessageTypeEnum(str, Enum):
+    # without attachments
+    TEXT = "text"
+    SYSTEM = 'system'
+    REACTION = 'reaction'
+    UNDEFINED = 'undefined'
+
+    # with attachments
+    SHARED = 'shared'
+    PHOTO = "photo"
+    VIDEO = "video"
+    AUDIO = "audio"
+    MUTLI_MEDIA = 'multi_media'
+
+
+class MessageStatusEnum(str, Enum):
+    APPROVED = "approved"
+    MODERATED = "moderated"
+    PENDING = "pending"
+    REJECTED = 'rejected'
+
+
+
+class SessionStatusEnum(str, Enum):
+    ACTIVE = 'active'
+    PROCESS = 'process'
+    INACTIVE = 'inactive'
+
+
+class ThreadColorEnum(str, Enum):
+    GREEN = "green"
+    YELLOW = "yellow"
+    RED = "red"
+    DARK_RED = 'dark_red'
+    GREY = "grey"
+
+
+class AIModelEnum(str, Enum):
+    CLAUDE_SONNET_5 = 'anthropic/claude-sonnet-5'
+    CLAUDE_SONNET_4_6 = 'anthropic/claude-sonnet-4.6'
+    CLAUDE_SONNET_4_5 = 'anthropic/claude-sonnet-4.5'
+    CLAUDE_OPUS_4_8 = 'anthropic/claude-opus-4.8'
+    CLAUDE_OPUS_4_6 = 'anthropic/claude-opus-4.6'
+    DEEPSEEK_LATEST = "deepseek/deepseek-v4.1-flash"
+    QWEN_3 = 'qwen/qwen3-14b'
+    QWEN_ORCA = 'obsidian/Qwen3.8-27B'
+    GLM_FREE = 'z-ai/glm-5.2:free'
+    GLM_4_6 = 'z-ai/glm-4.6'
+
+
+class LanguageEnum(str, Enum):
+    AFRIKAANS = "Afrikaans"
+    ARABIC = "Arabic"
+    BENGALI = "Bengali"
+    BULGARIAN = "Bulgarian"
+    CANTONESE = "Cantonese"
+    CHINESE = "Chinese"
+    CROATIAN = "Croatian"
+    CZECH = "Czech"
+    DANISH = "Danish"
+    DUTCH = "Dutch"
+    ENGLISH = "English"
+    FINNISH = "Finnish"
+    FILIPINO = "Filipino"
+    FRENCH = "French"
+    GERMAN = "German"
+    GREEK = "Greek"
+    GUJARATI = "Gujarati"
+    HEBREW = "Hebrew"
+    HINDI = "Hindi"
+    HUNGARIAN = "Hungarian"
+    INDONESIAN = "Indonesian"
+    ITALIAN = "Italian"
+    JAPANESE = "Japanese"
+    KANNADA = "Kannada"
+    KOREAN = "Korean"
+    MALAY = "Malay"
+    MALAYALAM = "Malayalam"
+    MARATHI = "Marathi"
+    NIGERIAN_PIDGIN = "Nigerian Pidgin"
+    NORWEGIAN = "Norwegian"
+    ODIA = "Odia"
+    PERSIAN = "Persian"
+    POLISH = "Polish"
+    PORTUGUESE = "Portuguese"
+    PUNJABI = "Punjabi"
+    ROMANIAN = "Romanian"
+    RUSSIAN = "Russian"
+    SERBIAN = "Serbian"
+    SLOVAK = "Slovak"
+    SPANISH = "Spanish"
+    SWAHILI = "Swahili"
+    SWEDISH = "Swedish"
+    TAMIL = "Tamil"
+    TELUGU = "Telugu"
+    THAI = "Thai"
+    TURKISH = "Turkish"
+    UKRAINIAN = "Ukrainian"
+    URDU = "Urdu"
+    VIETNAMESE = "Vietnamese"
+    ZULU = "Zulu"
+
+
+class ScenarioStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class ScenarioEvaluationType(str, Enum):
+    NOAL = "noal"
+    CHOICE = "choice"
+    SCORE = 'score'
+
+class ScenarioConditionOperator(str, Enum):
+    # AI отдаёт вероятности числами — сравниваем только численно
+    GREATER = "gt"
+    GREATER_OR_EQUAL = "gte"
+    LESS = "lt"
+    LESS_OR_EQUAL = "lte"
+
+
+class CoffeeStatusEnum(str, Enum):
+    ACTIVE = "active"
+    MODERATING = 'moderating'
+    PAUSE = 'in pause'
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    PREPARING = 'preparing'
+
+
+class CoffeeStepLogSchema(str, Enum):
+    WAITING = 'waiting'
+    COMPLETED = 'completed'
+    CANCELLED = "cancelled"
+
+
+class CoffeeStepTypeSchema(str, Enum):
+    TEXT_MESSAGE = 'text'
+    PHOTO_MESSAGE = 'photo'
+    MODERATING = 'moderating'
+    PREPARING = 'preparing'
+    
